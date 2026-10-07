@@ -357,3 +357,93 @@ class FitBundle:
     def active_features(self) -> List[str]:
         return self.preprocessor.active_features
 
+def model_specs(target: str) -> List[ModelSpec]:
+    specs = []
+    for transform in target_transform_candidates(target):
+        for a in RIDGE_GRID:
+            specs.append(ModelSpec("Ridge", {"alpha": a}, transform))
+        for p in XGB_PROFILES:
+            specs.append(ModelSpec("XGB", dict(p), transform))
+    return specs
+
+
+def _make_model(spec: ModelSpec):
+    if spec.kind == "Ridge":
+        return Ridge(alpha=float(spec.params["alpha"]), fit_intercept=True)
+    if spec.kind == "XGB":
+        return XGBRegressor(
+            **spec.params,
+            objective="reg:squarederror",
+            random_state=RANDOM_STATE,
+            n_jobs=1,
+            verbosity=0,
+        )
+    raise ValueError(spec.kind)
+
+
+def fit_bundle(train_raw: pd.DataFrame, target: str, features: List[str], spec: ModelSpec) -> FitBundle:
+    train = apply_self_transform(train_raw, target, spec.transform)
+    prep = PanelPreprocessor(features, scale=(spec.kind == "Ridge")).fit(train)
+    if not prep.active_features:
+        raise ValueError(f"No active features for {target}")
+    X = prep.transform(train)
+    y_raw = pd.to_numeric(train[target], errors="coerce").to_numpy(float)
+    y = forward_target(y_raw, spec.transform)
+    model = _make_model(spec)
+    model.fit(X, y)
+    return FitBundle(target, spec, list(features), prep, model, X, train.copy())
+
+
+def predict_raw(bundle: FitBundle, frame_raw: pd.DataFrame) -> np.ndarray:
+    frame = apply_self_transform(frame_raw, bundle.target, bundle.spec.transform)
+    X = bundle.preprocessor.transform(frame)
+    z = np.asarray(bundle.model.predict(X), float)
+    return inverse_target(z, bundle.spec.transform)
+
+
+def inner_score_spec(train: pd.DataFrame, target: str, features: List[str], spec: ModelSpec) -> float:
+    splits = inner_splits(train, target)
+    if not splits:
+        return np.inf
+    scores = []
+    for tr, va in splits:
+        try:
+            b = fit_bundle(tr, target, features, spec)
+            pred = predict_raw(b, va)
+            y = pd.to_numeric(va[target], errors="coerce").to_numpy(float)
+            score = balanced_nmae(y, pred, va.Country, country_scales(tr, target))
+        except Exception:
+            score = np.inf
+        scores.append(score)
+    return float(np.mean(scores)) if scores else np.inf
+
+
+def specs_for_kind(target: str, kind: str) -> List[ModelSpec]:
+    return [s for s in model_specs(target) if s.kind == kind]
+
+
+def tune_kind_on_features(train: pd.DataFrame, target: str, features: List[str], kind: str) -> Tuple[ModelSpec, float, pd.DataFrame]:
+    rows = []
+    best_spec = None
+    best_score = np.inf
+    for spec_id, spec in enumerate(specs_for_kind(target, kind)):
+        score = inner_score_spec(train, target, features, spec)
+        rows.append({"stage": "tune", "kind": kind, "spec_id": spec_id,
+                     "transform": spec.transform, "params": json.dumps(spec.params, sort_keys=True),
+                     "n_features": len(features), "balanced_nmae": score})
+        if score < best_score:
+            best_score = score
+            best_spec = spec
+    if best_spec is None or not np.isfinite(best_score):
+        raise ValueError(f"No valid {kind} specification for {target}")
+    return best_spec, best_score, pd.DataFrame(rows)
+
+
+def features_from_sources(groups: Dict[str, List[str]], selected_sources: List[str]) -> List[str]:
+    f = []
+    for src in selected_sources:
+        f.extend(groups[src])
+    f.extend(groups["__SELF__"])
+    f.extend(groups["__COUNTRY__"])
+    return list(dict.fromkeys(f))
+
