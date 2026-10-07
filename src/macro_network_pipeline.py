@@ -178,3 +178,182 @@ def build_target_frame(full: pd.DataFrame, target: str) -> Tuple[pd.DataFrame, L
         cols = []
         for lag in (1, 2):
             name = f"{src}_lag{lag}"
+            d[name] = d.groupby("Country")[src].shift(lag)
+            cols.append(name); features.append(name)
+        groups[src] = cols
+    self_cols = []
+    for lag in (1, 2):
+        name = f"{target}_self_lag{lag}"
+        d[name] = d.groupby("Country")[target].shift(lag)
+        self_cols.append(name); features.append(name)
+    groups["__SELF__"] = self_cols
+    # Four dummies + intercept; avoids exact dummy trap in Ridge.
+    for c in COUNTRIES:
+        if c == COUNTRY_REFERENCE:
+            continue
+        name = f"C_{c}"
+        d[name] = (d["Country"] == c).astype(float)
+        features.append(name)
+    groups["__COUNTRY__"] = [f"C_{c}" for c in COUNTRIES if c != COUNTRY_REFERENCE]
+    d = d[d["Date"].between(1994, 2024)].copy()
+    return d, features, groups
+
+
+@dataclass
+class PanelPreprocessor:
+    feature_names: List[str]
+    scale: bool
+    active_features: List[str] = field(default_factory=list)
+    global_median: Dict[str, float] = field(default_factory=dict)
+    country_median: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    scaler: Optional[StandardScaler] = None
+
+    def fit(self, train: pd.DataFrame) -> "PanelPreprocessor":
+        self.active_features = []
+        self.global_median = {}
+        self.country_median = {}
+        for f in self.feature_names:
+            vals = pd.to_numeric(train[f], errors="coerce")
+            if not vals.notna().any():
+                # All-missing in this training fold: unavailable, do not create fake zero information.
+                continue
+            self.active_features.append(f)
+            if f.startswith("C_"):
+                self.global_median[f] = 0.0
+                self.country_median[f] = {c: 0.0 for c in COUNTRIES}
+                continue
+            gmed = float(vals.median())
+            self.global_median[f] = gmed
+            cm = {}
+            for c in COUNTRIES:
+                x = pd.to_numeric(train.loc[train.Country == c, f], errors="coerce")
+                cm[c] = float(x.median()) if x.notna().any() else gmed
+            self.country_median[f] = cm
+        X = self._impute(train)
+        if self.scale:
+            self.scaler = StandardScaler().fit(X)
+        return self
+
+    def _impute(self, df: pd.DataFrame) -> np.ndarray:
+        cols = []
+        countries = df["Country"].astype(str).to_numpy()
+        for f in self.active_features:
+            x = pd.to_numeric(df[f], errors="coerce").to_numpy(dtype=float)
+            if not f.startswith("C_"):
+                miss = ~np.isfinite(x)
+                if miss.any():
+                    repl = np.array([self.country_median[f].get(c, self.global_median[f]) for c in countries])
+                    x[miss] = repl[miss]
+            else:
+                x[~np.isfinite(x)] = 0.0
+            cols.append(x)
+        return np.column_stack(cols) if cols else np.empty((len(df), 0))
+
+    def transform(self, df: pd.DataFrame) -> np.ndarray:
+        X = self._impute(df)
+        if self.scale and self.scaler is not None:
+            X = self.scaler.transform(X)
+        return X
+
+
+def apply_self_transform(df: pd.DataFrame, target: str, transform: str) -> pd.DataFrame:
+    """Transform only target's own lag controls; cross-variable source lags remain raw."""
+    out = df.copy()
+    if transform != "identity":
+        for lag in (1, 2):
+            col = f"{target}_self_lag{lag}"
+            out[col] = forward_target(pd.to_numeric(out[col], errors="coerce").to_numpy(), transform)
+    return out
+
+
+def outer_splits(d: pd.DataFrame, target: str) -> List[Dict[str, Any]]:
+    out = []
+    for fold, (a, b, c, e) in enumerate(OUTER_WINDOWS, start=1):
+        tr = d[(d.Date.between(a, b)) & d[target].notna()].copy()
+        va = d[(d.Date.between(c, e)) & d[target].notna()].copy()
+        out.append({
+            "fold": fold, "train": tr, "valid": va,
+            "train_start": a, "train_end": b, "valid_start": c, "valid_end": e,
+            "reliable": len(tr) >= MIN_OUTER_TRAIN_ROWS and len(va) >= 5,
+        })
+    return out
+
+
+def inner_splits(train: pd.DataFrame, target: str, n_splits: int = 2) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
+    years = sorted(train.loc[train[target].notna(), "Date"].unique())
+    if len(years) < 8:
+        return []
+    cut = max(5, int(math.ceil(0.55 * len(years))))
+    remaining = years[cut:]
+    chunks = [list(x) for x in np.array_split(remaining, n_splits) if len(x)]
+    train_years = list(years[:cut])
+    out = []
+    for chunk in chunks:
+        tr = train[train.Date.isin(train_years) & train[target].notna()].copy()
+        va = train[train.Date.isin(chunk) & train[target].notna()].copy()
+        if len(tr) >= MIN_INNER_TRAIN_ROWS and len(va) >= 5:
+            out.append((tr, va))
+        train_years += chunk
+    return out
+
+
+def country_scales(train: pd.DataFrame, target: str) -> Dict[str, float]:
+    y = pd.to_numeric(train[target], errors="coerce")
+    global_sd = float(y.std(ddof=1)) if y.notna().sum() > 1 else 1.0
+    if not np.isfinite(global_sd) or global_sd <= 1e-12:
+        global_sd = 1.0
+    out = {}
+    for c in COUNTRIES:
+        z = pd.to_numeric(train.loc[train.Country == c, target], errors="coerce")
+        sd = float(z.std(ddof=1)) if z.notna().sum() > 1 else global_sd
+        out[c] = sd if np.isfinite(sd) and sd > 1e-12 else global_sd
+    return out
+
+
+def balanced_nmae(y_true: np.ndarray, y_pred: np.ndarray, countries: Iterable[str], scales: Dict[str, float]) -> float:
+    y_true = np.asarray(y_true, float); y_pred = np.asarray(y_pred, float); countries = np.asarray(list(countries))
+    scores = []
+    for c in np.unique(countries):
+        m = countries == c
+        if m.sum() == 0:
+            continue
+        scores.append(float(np.mean(np.abs(y_true[m] - y_pred[m])) / scales[str(c)]))
+    return float(np.mean(scores)) if scores else np.nan
+
+
+def persistence_metrics(train: pd.DataFrame, valid: pd.DataFrame, target: str) -> Dict[str, float]:
+    y = pd.to_numeric(valid[target], errors="coerce").to_numpy(float)
+    p = pd.to_numeric(valid[f"{target}_self_lag1"], errors="coerce").to_numpy(float)
+    m = np.isfinite(y) & np.isfinite(p)
+    if m.sum() < 2:
+        return {"r2": np.nan, "rmse": np.nan, "mae": np.nan, "balanced_nmae": np.nan}
+    scales = country_scales(train, target)
+    return {
+        "r2": float(r2_score(y[m], p[m])),
+        "rmse": float(np.sqrt(mean_squared_error(y[m], p[m]))),
+        "mae": float(mean_absolute_error(y[m], p[m])),
+        "balanced_nmae": balanced_nmae(y[m], p[m], valid.loc[m, "Country"], scales),
+    }
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    kind: str
+    params: Dict[str, Any]
+    transform: str
+
+
+@dataclass
+class FitBundle:
+    target: str
+    spec: ModelSpec
+    features_requested: List[str]
+    preprocessor: PanelPreprocessor
+    model: Any
+    X_train: np.ndarray
+    train_frame: pd.DataFrame
+
+    @property
+    def active_features(self) -> List[str]:
+        return self.preprocessor.active_features
+
