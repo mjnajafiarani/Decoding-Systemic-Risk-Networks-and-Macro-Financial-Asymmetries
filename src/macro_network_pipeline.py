@@ -447,3 +447,130 @@ def features_from_sources(groups: Dict[str, List[str]], selected_sources: List[s
     f.extend(groups["__COUNTRY__"])
     return list(dict.fromkeys(f))
 
+def backward_select_sources(train: pd.DataFrame, target: str, groups: Dict[str, List[str]],
+                            kind: str) -> Tuple[ModelSpec, List[str], List[str], float, pd.DataFrame]:
+    """Model-specific group backward selection using INNER folds only."""
+    selected = list(REL[target])
+    full_features = features_from_sources(groups, selected)
+    spec, current_score, tune_log = tune_kind_on_features(train, target, full_features, kind)
+    logs = [tune_log]
+
+    def prune_once(selected_sources: List[str], fixed_spec: ModelSpec, current: float):
+        history = []
+        changed = True
+        selected_local = list(selected_sources)
+        score_local = current
+        while changed and len(selected_local) > 0:
+            changed = False
+            candidates = []
+            for src in selected_local:
+                trial_sources = [x for x in selected_local if x != src]
+                trial_features = features_from_sources(groups, trial_sources)
+                score = inner_score_spec(train, target, trial_features, fixed_spec)
+                candidates.append((score, src, trial_sources))
+                history.append({"stage": "backward", "kind": kind, "removed_source": src,
+                                "transform": fixed_spec.transform,
+                                "params": json.dumps(fixed_spec.params, sort_keys=True),
+                                "n_sources_before": len(selected_local),
+                                "balanced_nmae": score})
+            candidates.sort(key=lambda x: (x[0], x[1]))
+            best_score, best_src, best_sources = candidates[0]
+            if np.isfinite(best_score) and best_score < score_local - 1e-12:
+                selected_local = best_sources
+                score_local = best_score
+                changed = True
+        return selected_local, score_local, pd.DataFrame(history)
+
+    selected, current_score, h1 = prune_once(selected, spec, current_score)
+    logs.append(h1)
+    selected_features = features_from_sources(groups, selected)
+    spec2, score2, tune2 = tune_kind_on_features(train, target, selected_features, kind)
+    logs.append(tune2.assign(stage="retune"))
+    selected2, score3, h2 = prune_once(selected, spec2, score2)
+    logs.append(h2.assign(stage="backward_after_retune"))
+    final_features = features_from_sources(groups, selected2)
+    final_spec, final_score, tune3 = tune_kind_on_features(train, target, final_features, kind)
+    logs.append(tune3.assign(stage="final_tune"))
+
+    self_features = features_from_sources(groups, [])
+    self_spec, self_score, self_log = tune_kind_on_features(train, target, self_features, kind)
+    logs.append(self_log.assign(stage="self_only_tune"))
+    if self_score <= final_score + 1e-12:
+        return self_spec, [], self_features, self_score, pd.concat(logs, ignore_index=True)
+    return final_spec, selected2, final_features, final_score, pd.concat(logs, ignore_index=True)
+
+
+def select_pipeline_nested(train: pd.DataFrame, target: str, groups: Dict[str, List[str]]) -> Tuple[ModelSpec, List[str], List[str], float, pd.DataFrame]:
+    candidates = []
+    logs = []
+    for kind in ("Ridge", "XGB"):
+        spec, sources, features, score, log = backward_select_sources(train, target, groups, kind)
+        log["target"] = target
+        logs.append(log)
+        candidates.append((score, 0 if kind == "Ridge" else 1, spec, sources, features))
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    score, _, spec, sources, features = candidates[0]
+    return spec, sources, features, score, pd.concat(logs, ignore_index=True)
+
+
+def evaluate_bundle(bundle: FitBundle, train: pd.DataFrame, valid: pd.DataFrame, target: str) -> Dict[str, float]:
+    pred = predict_raw(bundle, valid)
+    y = pd.to_numeric(valid[target], errors="coerce").to_numpy(float)
+    scales = country_scales(train, target)
+    p = persistence_metrics(train, valid, target)
+    bnm = balanced_nmae(y, pred, valid.Country, scales)
+    return {
+        "r2": float(r2_score(y, pred)) if len(y) >= 2 else np.nan,
+        "rmse": float(np.sqrt(mean_squared_error(y, pred))),
+        "mae": float(mean_absolute_error(y, pred)),
+        "balanced_nmae": bnm,
+        "persistence_balanced_nmae": p["balanced_nmae"],
+        "skill_vs_persistence": (1.0 - bnm / p["balanced_nmae"])
+            if np.isfinite(p["balanced_nmae"]) and p["balanced_nmae"] > 0 else np.nan,
+        "persistence_r2": p["r2"],
+    }
+
+
+def _extract_shap_values(bundle: FitBundle, valid_raw: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    if shap is None:
+        raise RuntimeError("SHAP is not installed")
+    valid = apply_self_transform(valid_raw, bundle.target, bundle.spec.transform)
+    Xv = bundle.preprocessor.transform(valid)
+    if bundle.spec.kind == "XGB":
+        explainer = shap.TreeExplainer(bundle.model)
+        try:
+            sv = np.asarray(explainer(Xv).values)
+        except Exception:
+            sv = np.asarray(explainer.shap_values(Xv))
+    else:
+        explainer = shap.LinearExplainer(bundle.model, bundle.X_train)
+        try:
+            sv = np.asarray(explainer(Xv).values)
+        except Exception:
+            sv = np.asarray(explainer.shap_values(Xv))
+    return sv, Xv, list(bundle.active_features)
+
+
+def shap_feature_table(bundle: FitBundle, valid_raw: pd.DataFrame, fold: int) -> pd.DataFrame:
+    sv, Xv, names = _extract_shap_values(bundle, valid_raw)
+    rows = []
+    for j, f in enumerate(names):
+        a = sv[:, j].astype(float)
+        x = Xv[:, j].astype(float)
+        abs_sum = float(np.abs(a).sum())
+        pos_abs = float(np.abs(a[a > 0]).sum())
+        neg_abs = float(np.abs(a[a < 0]).sum())
+        if len(a) >= 3 and np.nanstd(x) > 0 and np.nanstd(a) > 0:
+            rho = float(pd.Series(x).corr(pd.Series(a), method="spearman"))
+        else:
+            rho = np.nan
+        rows.append({
+            "target": bundle.target, "fold": fold, "model": bundle.spec.kind,
+            "transform": bundle.spec.transform, "feature": f,
+            "n_valid": len(valid_raw), "mean_abs_shap": float(np.mean(np.abs(a))),
+            "abs_sum": abs_sum, "pos_abs_sum": pos_abs, "neg_abs_sum": neg_abs,
+            "contrib_balance": ((pos_abs - neg_abs) / abs_sum) if abs_sum > 0 else np.nan,
+            "feature_shap_spearman": rho,
+        })
+    return pd.DataFrame(rows)
+
