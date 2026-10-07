@@ -735,3 +735,165 @@ def aggregate_w(shap_features: pd.DataFrame, edge_support: pd.DataFrame,
             avail, on=["source", "target"], how="left")
     return {"W_edges": W, "W_lags": WL, "W_fold_edges": fe, "W_fold_lags": fl}
 
+def raw_state_lookup(full: pd.DataFrame) -> Dict[Tuple[str, int], Dict[str, float]]:
+    raw = full[full.Date.between(1994, 2024)][["Country", "Date"] + VARS10].copy()
+    out = {}
+    for _, r in raw.iterrows():
+        out[(str(r.Country), int(r.Date))] = {
+            v: (float(r[v]) if pd.notna(r[v]) else np.nan) for v in VARS10
+        }
+    return out
+
+
+def _one_row_for_state(target: str, country: str, prev: Dict[str, float],
+                       prev2: Dict[str, float], features: List[str]) -> pd.DataFrame:
+    vals: Dict[str, float] = {"Country": country}
+    for src in REL[target]:
+        vals[f"{src}_lag1"] = prev.get(src, np.nan)
+        vals[f"{src}_lag2"] = prev2.get(src, np.nan)
+    vals[f"{target}_self_lag1"] = prev.get(target, np.nan)
+    vals[f"{target}_self_lag2"] = prev2.get(target, np.nan)
+    for c in COUNTRIES:
+        if c != COUNTRY_REFERENCE:
+            vals[f"C_{c}"] = 1.0 if c == country else 0.0
+    return pd.DataFrame([{k: vals.get(k, np.nan) for k in ["Country"] + features}])
+
+
+def predict_from_state(bundle: FitBundle, country: str, prev: Dict[str, float],
+                       prev2: Dict[str, float]) -> float:
+    row = _one_row_for_state(bundle.target, country, prev, prev2, bundle.features_requested)
+    return float(predict_raw(bundle, row)[0])
+
+
+def simulate_system(bundles: Dict[str, FitBundle],
+                    observed: Dict[Tuple[str, int], Dict[str, float]],
+                    country: str, start_year: int, horizon: int = 3,
+                    shock_source: Optional[str] = None,
+                    shock_delta: float = 0.0) -> Dict[int, Dict[str, float]]:
+    if (country, start_year - 1) not in observed or (country, start_year) not in observed:
+        raise KeyError("Observed initial state unavailable")
+    prev2 = observed[(country, start_year - 1)].copy()
+    prev = observed[(country, start_year)].copy()
+    if shock_source is not None:
+        if not np.isfinite(prev.get(shock_source, np.nan)):
+            raise ValueError(f"Cannot shock missing {shock_source} at {country}-{start_year}")
+        prev[shock_source] += shock_delta
+    states = {start_year - 1: prev2, start_year: prev}
+    for h in range(1, horizon + 1):
+        year = start_year + h
+        new = {
+            target: predict_from_state(
+                bundles[target], country, states[year - 1], states[year - 2]
+            )
+            for target in VARS10
+        }
+        states[year] = new
+    return states
+
+
+def response_from_outer_folds(full: pd.DataFrame,
+                              bundles_by_fold: Dict[int, Dict[str, FitBundle]],
+                              horizon: int = 3) -> pd.DataFrame:
+    """Fold-wise recursive +1SD response using only complete ten-equation systems."""
+    observed = raw_state_lookup(full)
+    rows = []
+    for fold, bundles in bundles_by_fold.items():
+        if set(bundles) != set(VARS10):
+            continue
+        _, train_end, valid_start, valid_end = OUTER_WINDOWS[fold - 1]
+        train_raw = full[full.Date.between(1994, train_end)].copy()
+        global_sd = train_raw[VARS10].std(ddof=1)
+        sd = train_raw.groupby("Country")[VARS10].std(ddof=1)
+        for c in COUNTRIES:
+            for v in VARS10:
+                if not np.isfinite(sd.loc[c, v]) or sd.loc[c, v] <= 1e-12:
+                    sd.loc[c, v] = global_sd[v]
+        starts = range(valid_start, valid_end - horizon + 1)
+        for c in COUNTRIES:
+            for start in starts:
+                if (c, start - 1) not in observed or (c, start) not in observed:
+                    continue
+                if any(not np.isfinite(observed[(c, start)][v]) for v in VARS10):
+                    continue
+                base = simulate_system(bundles, observed, c, start, horizon=horizon)
+                for src in VARS10:
+                    delta = float(sd.loc[c, src])
+                    shocked = simulate_system(
+                        bundles, observed, c, start, horizon=horizon,
+                        shock_source=src, shock_delta=delta
+                    )
+                    for h in range(1, horizon + 1):
+                        for tgt in VARS10:
+                            denom = float(sd.loc[c, tgt])
+                            dr = shocked[start + h][tgt] - base[start + h][tgt]
+                            rows.append({
+                                "fold": fold, "country": c, "start_year": start,
+                                "source": src, "target": tgt, "horizon": h,
+                                "shock_raw_1sd": delta, "response_raw": dr,
+                                "response_std": dr / denom if denom > 0 else np.nan
+                            })
+    return pd.DataFrame(rows)
+
+
+def aggregate_r(response: pd.DataFrame, horizon: int = 3) -> Dict[str, pd.DataFrame]:
+    if response.empty:
+        return {}
+    traj = response[response.horizon <= horizon].groupby(
+        ["fold", "country", "start_year", "source", "target"], as_index=False
+    ).agg(
+        cum_std=("response_std", "sum"),
+        peak_abs=("response_std", lambda x: float(np.max(np.abs(x))))
+    )
+    ctry = traj.groupby(
+        ["fold", "country", "source", "target"], as_index=False
+    ).agg(
+        country_median_cum=("cum_std", "median"),
+        country_median_peak=("peak_abs", "median")
+    )
+    fold = ctry.groupby(["fold", "source", "target"], as_index=False).agg(
+        fold_median_cum=("country_median_cum", "median"),
+        fold_q25=("country_median_cum", lambda x: float(np.quantile(x, .25))),
+        fold_q75=("country_median_cum", lambda x: float(np.quantile(x, .75)))
+    )
+    glob = fold.groupby(["source", "target"], as_index=False).agg(
+        R=("fold_median_cum", "median"),
+        R_mean=("fold_median_cum", "mean"),
+        R_sd=("fold_median_cum", "std"),
+        n_R_folds=("fold", "nunique")
+    )
+    rh = response.groupby(
+        ["fold", "country", "source", "target", "horizon"], as_index=False
+    ).agg(country_median=("response_std", "median"))
+    rh = rh.groupby(
+        ["source", "target", "horizon"], as_index=False
+    ).agg(
+        R_h=("country_median", "median"),
+        R_h_q25=("country_median", lambda x: float(np.quantile(x, .25))),
+        R_h_q75=("country_median", lambda x: float(np.quantile(x, .75)))
+    )
+    return {
+        "R_global": glob,
+        "R_fold": fold,
+        "R_country": ctry,
+        "R_horizon": rh,
+        "R_trajectory": traj
+    }
+
+
+def run_data_audit(path: str = DATA_FILE) -> None:
+    full = load_panel(path)
+    a = audit_panel(full)
+    print("rows 1994-2024:", a["n_rows"])
+    print("country rows:", a["country_rows"])
+    print("duplicate country-years:", a["duplicate_country_year"])
+    print("\nmissing by country:\n", a["missing_by_country"].to_string())
+    print("\nCDS observed span:", a["observed_span"]["CDS"])
+    assert a["n_rows"] == 155
+    assert a["duplicate_country_year"] == 0
+    assert all(a["country_rows"].get(c) == 31 for c in COUNTRIES)
+    assert sum(len(v) for v in REL.values()) == 71
+    print("\nPASS: panel integrity and 71-edge literature skeleton checks.")
+
+
+if __name__ == "__main__":
+    run_data_audit()
