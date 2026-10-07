@@ -574,3 +574,164 @@ def shap_feature_table(bundle: FitBundle, valid_raw: pd.DataFrame, fold: int) ->
         })
     return pd.DataFrame(rows)
 
+def grouped_edge_support(bundle: FitBundle, train: pd.DataFrame, valid: pd.DataFrame,
+                         target: str, groups: Dict[str, List[str]]) -> pd.DataFrame:
+    """Out-of-fold incremental support via grouped drop-column refitting."""
+    full_metrics = evaluate_bundle(bundle, train, valid, target)
+    full_score = full_metrics["balanced_nmae"]
+    rows = []
+    active = set(bundle.active_features)
+    for source in REL[target]:
+        source_cols = groups[source]
+        available = any(c in active for c in source_cols)
+        if not available:
+            rows.append({"target": target, "source": source, "available": False,
+                         "full_balanced_nmae": full_score, "reduced_balanced_nmae": np.nan,
+                         "delta_nmae": np.nan, "supported": False})
+            continue
+        reduced_features = [f for f in bundle.features_requested if f not in source_cols]
+        red = fit_bundle(train, target, reduced_features, bundle.spec)
+        pred = predict_raw(red, valid)
+        y = pd.to_numeric(valid[target], errors="coerce").to_numpy(float)
+        red_score = balanced_nmae(y, pred, valid.Country, country_scales(train, target))
+        delta = float(red_score - full_score)
+        rows.append({"target": target, "source": source, "available": True,
+                     "full_balanced_nmae": full_score, "reduced_balanced_nmae": red_score,
+                     "delta_nmae": delta, "supported": bool(delta > 0)})
+    return pd.DataFrame(rows)
+
+
+def run_nested_core(full: pd.DataFrame, compute_shap: bool = True,
+                    compute_edge_support: bool = True) -> Dict[str, Any]:
+    perf_rows, inner_rows, shap_rows, support_rows, selection_rows = [], [], [], [], []
+    bundles_by_fold: Dict[int, Dict[str, FitBundle]] = {1: {}, 2: {}, 3: {}}
+    for target in VARS10:
+        d, features, groups = build_target_frame(full, target)
+        for split in outer_splits(d, target):
+            fold = split["fold"]
+            tr, va = split["train"], split["valid"]
+            if not split["reliable"]:
+                perf_rows.append({"target": target, "fold": fold, "reliable": False,
+                                  "n_train": len(tr), "n_valid": len(va)})
+                continue
+            spec, selected_sources, selected_features, inner_score, inner = select_pipeline_nested(tr, target, groups)
+            inner["outer_fold"] = fold
+            inner_rows.append(inner)
+            bundle = fit_bundle(tr, target, selected_features, spec)
+            bundles_by_fold[fold][target] = bundle
+            for src in REL[target]:
+                selection_rows.append({"target": target, "source": src, "fold": fold,
+                                       "selected": src in selected_sources, "model": spec.kind,
+                                       "transform": spec.transform})
+            met = evaluate_bundle(bundle, tr, va, target)
+            perf_rows.append({"target": target, "fold": fold, "reliable": True,
+                              "n_train": len(tr), "n_valid": len(va), "model": spec.kind,
+                              "transform": spec.transform, "params": json.dumps(spec.params, sort_keys=True),
+                              "n_active_features": len(bundle.active_features),
+                              "n_selected_sources": len(selected_sources),
+                              "selected_sources": ";".join(selected_sources),
+                              "inner_balanced_nmae": inner_score, **met})
+            if compute_shap:
+                shap_rows.append(shap_feature_table(bundle, va, fold))
+            if compute_edge_support:
+                z = grouped_edge_support(bundle, tr, va, target, groups)
+                z["fold"] = fold
+                z["model"] = spec.kind
+                z["transform"] = spec.transform
+                support_rows.append(z)
+    return {
+        "performance": pd.DataFrame(perf_rows),
+        "inner_cv": pd.concat(inner_rows, ignore_index=True) if inner_rows else pd.DataFrame(),
+        "shap_features": pd.concat(shap_rows, ignore_index=True) if shap_rows else pd.DataFrame(),
+        "edge_support": pd.concat(support_rows, ignore_index=True) if support_rows else pd.DataFrame(),
+        "edge_selection": pd.DataFrame(selection_rows),
+        "bundles_by_fold": bundles_by_fold,
+    }
+
+
+def classify_feature(feature: str, target: str) -> Tuple[str, int, str]:
+    if feature.startswith("C_"):
+        return "COUNTRY", 0, "country"
+    if "_self_lag" in feature:
+        return target, int(feature.rsplit("lag", 1)[1]), "self"
+    if "_lag" in feature:
+        source, lag = feature.rsplit("_lag", 1)
+        return source, int(lag), "cross"
+    return feature, 0, "other"
+
+
+def aggregate_w(shap_features: pd.DataFrame, edge_support: pd.DataFrame,
+                edge_selection: Optional[pd.DataFrame] = None) -> Dict[str, pd.DataFrame]:
+    """Aggregate out-of-fold W, selection stability, incremental support, and lag layers."""
+    if shap_features.empty:
+        return {}
+    sf = shap_features.copy()
+    parsed = sf.apply(lambda r: classify_feature(r.feature, r.target), axis=1)
+    sf[["source", "lag", "feature_type"]] = pd.DataFrame(parsed.tolist(), index=sf.index)
+
+    observed_edges, observed_lags = [], []
+    for (target, fold), g in sf.groupby(["target", "fold"]):
+        dynamic = g[g.feature_type.isin(["cross", "self"])]["mean_abs_shap"].sum()
+        if dynamic <= 0:
+            continue
+        for (source, lag), q in g[g.feature_type == "cross"].groupby(["source", "lag"]):
+            pos = q.pos_abs_sum.sum()
+            neg = q.neg_abs_sum.sum()
+            den = pos + neg
+            observed_lags.append({
+                "target": target, "source": source, "lag": int(lag), "fold": fold,
+                "W_fold_lag": q.mean_abs_shap.sum() / dynamic,
+                "D_fold_lag": (pos - neg) / den if den > 0 else np.nan,
+                "rho_fold_lag": q.feature_shap_spearman.mean(),
+            })
+        for source, q in g[g.feature_type == "cross"].groupby("source"):
+            pos = q.pos_abs_sum.sum()
+            neg = q.neg_abs_sum.sum()
+            den = pos + neg
+            observed_edges.append({
+                "target": target, "source": source, "fold": fold,
+                "W_fold": q.mean_abs_shap.sum() / dynamic,
+                "D_fold": (pos - neg) / den if den > 0 else np.nan,
+                "rho_fold": q.feature_shap_spearman.mean(),
+            })
+
+    obs_e = pd.DataFrame(observed_edges)
+    obs_l = pd.DataFrame(observed_lags)
+
+    if edge_selection is None or edge_selection.empty:
+        fe = obs_e.copy()
+        fl = obs_l.copy()
+        W = fe.groupby(["source", "target"], as_index=False).agg(
+            W=("W_fold", "mean"), W_sd=("W_fold", "std"), D=("D_fold", "mean"),
+            rho=("rho_fold", "mean"), n_W_folds=("fold", "nunique"))
+        WL = fl.groupby(["source", "target", "lag"], as_index=False).agg(
+            W_lag=("W_fold_lag", "mean"), D_lag=("D_fold_lag", "mean"),
+            rho_lag=("rho_fold_lag", "mean"), n_W_folds=("fold", "nunique"))
+        return {"W_edges": W, "W_lags": WL, "W_fold_edges": fe, "W_fold_lags": fl}
+
+    grid = edge_selection[["target", "source", "fold", "selected"]].copy()
+    fe = grid.merge(obs_e, on=["target", "source", "fold"], how="left")
+    fe["W_fold"] = fe["W_fold"].fillna(0.0)
+    W = fe.groupby(["source", "target"], as_index=False).agg(
+        W=("W_fold", "mean"), W_sd=("W_fold", "std"), D=("D_fold", "mean"),
+        rho=("rho_fold", "mean"), n_W_folds=("fold", "nunique"),
+        S_select=("selected", "mean"))
+
+    lag_grid = grid.loc[grid.index.repeat(2), ["target", "source", "fold"]].copy()
+    lag_grid["lag"] = np.tile([1, 2], len(grid))
+    fl = lag_grid.merge(obs_l, on=["target", "source", "fold", "lag"], how="left")
+    fl["W_fold_lag"] = fl["W_fold_lag"].fillna(0.0)
+    WL = fl.groupby(["source", "target", "lag"], as_index=False).agg(
+        W_lag=("W_fold_lag", "mean"), D_lag=("D_fold_lag", "mean"),
+        rho_lag=("rho_fold_lag", "mean"), n_W_folds=("fold", "nunique"))
+
+    if not edge_support.empty:
+        es = edge_support.copy()
+        DS = es.groupby(["source", "target"], as_index=False).agg(
+            S_incremental=("supported", "mean"), n_support_folds=("fold", "nunique"))
+        avail = es[es.available].groupby(["source", "target"], as_index=False).agg(
+            mean_delta_nmae=("delta_nmae", "mean"), n_delta_folds=("fold", "nunique"))
+        W = W.merge(DS, on=["source", "target"], how="left").merge(
+            avail, on=["source", "target"], how="left")
+    return {"W_edges": W, "W_lags": WL, "W_fold_edges": fe, "W_fold_lags": fl}
+
