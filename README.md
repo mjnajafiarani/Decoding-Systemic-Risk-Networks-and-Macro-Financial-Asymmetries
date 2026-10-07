@@ -8,8 +8,8 @@ Current reproducibility materials are organized as follows:
 - `paper/results/`: numerical tables used by the paper.
 - `data/README.md`: expected input data structure.
 
-Legacy ZIP/RAR files in the repository root are retained from earlier development. The current paper uses the folders listed above.
+The workflow includes the 71-edge candidate graph, temporal validation, Ridge/XGBoost model selection, out-of-fold SHAP attribution, grouped ablation, recursive response analysis, and first-difference sensitivity.
 
-The workflow includes the candidate graph, temporal validation, Ridge/XGBoost model selection, SHAP attribution, grouped ablation, recursive response analysis, and first-difference sensitivity.
+The two own lags remain in each fitted equation as autoregressive self-links and are reported separately from the cross-variable network.
 
-See `paper/README.md` for the result map and `CITATION.cff` for citation metadata.
+See `paper/README.md` for the manuscript-to-result map and `CITATION.cff` for citation metadata.
