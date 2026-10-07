@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this code or derived result set, please cite the software release and the associated manuscript."
+title: "Reproducibility code for Decoding Persistence and Systemic Risk Asymmetries in Macro-Financial Networks"
+type: software
+authors:
+  - family-names: "Akcayir"
+    given-names: "Omer"
+  - family-names: "Nadjafi-Arani"
+    given-names: "M. J."
+  - family-names: "Safaie"
+    given-names: "M. Y."
+version: "1.0.0"
+date-released: "2026-10-07"
+repository-code: "https://github.com/mjnajafiarani/Decoding-Systemic-Risk-Networks-and-Macro-Financial-Asymmetries"
